@@ -1,0 +1,43 @@
+===== BUILD Sat 09/26/2026 22:10:13.81 ===== 
+CMAKE=C:\Program Files\Microsoft Visual Studio\18\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe
+MSBUILD=C:\Program Files\Microsoft Visual Studio\18\Enterprise\MSBuild\Current\Bin\MSBuild.exe
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.19044.
+-- The CXX compiler identification is MSVC 19.51.36257.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Program Files/Microsoft Visual Studio/18/Enterprise/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done (1.5s)
+-- Generating done (0.1s)
+-- Build files have been written to: C:/Users/StockLAnd/Desktop/multi-restream/build
+MSBuild version 18.10.1-1.26427.6+3cd27c13e for .NET Framework
+
+  main_client.cpp
+C:\Users\StockLAnd\Desktop\multi-restream\shared\protocol.h(54,13): warning C4996: 'sscanf': This function or variable may be unsafe. Consider using sscanf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\StockLAnd\Desktop\multi-restream\build\mr_client.vcxproj]
+  (compiling source file '../client/main_client.cpp')
+  
+  platform_ops.cpp
+C:\Users\StockLAnd\Desktop\multi-restream\shared\protocol.h(54,13): warning C4996: 'sscanf': This function or variable may be unsafe. Consider using sscanf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\StockLAnd\Desktop\multi-restream\build\mr_client.vcxproj]
+  (compiling source file '../client/platform_ops.cpp')
+  
+  Generating Code...
+  mr_client.vcxproj -> C:\Users\StockLAnd\Desktop\multi-restream\build\Release\mr_client.exe
+  chat_hub.cpp
+C:\Users\StockLAnd\Desktop\multi-restream\shared\protocol.h(54,13): warning C4996: 'sscanf': This function or variable may be unsafe. Consider using sscanf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\StockLAnd\Desktop\multi-restream\build\mr_server.vcxproj]
+  (compiling source file '../server/chat_hub.cpp')
+  
+  control_server.cpp
+C:\Users\StockLAnd\Desktop\multi-restream\shared\protocol.h(54,13): warning C4996: 'sscanf': This function or variable may be unsafe. Consider using sscanf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\StockLAnd\Desktop\multi-restream\build\mr_server.vcxproj]
+  (compiling source file '../server/control_server.cpp')
+  
+  main_server.cpp
+C:\Users\StockLAnd\Desktop\multi-restream\shared\protocol.h(54,13): warning C4996: 'sscanf': This function or variable may be unsafe. Consider using sscanf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\StockLAnd\Desktop\multi-restream\build\mr_server.vcxproj]
+  (compiling source file '../server/main_server.cpp')
+  
+  restream_engine.cpp
+C:\Users\StockLAnd\Desktop\multi-restream\shared\protocol.h(54,13): warning C4996: 'sscanf': This function or variable may be unsafe. Consider using sscanf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\StockLAnd\Desktop\multi-restream\build\mr_server.vcxproj]
+  (compiling source file '../server/restream_engine.cpp')
+  
+  Generating Code...
+  mr_server.vcxproj -> C:\Users\StockLAnd\Desktop\multi-restream\build\Release\mr_server.exe

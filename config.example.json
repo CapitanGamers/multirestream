@@ -1,0 +1,49 @@
+{
+  "control_port": 7788,
+  "rtmp_port": 1935,
+  "ingest_app": "live",
+  "ingest_key": "CHANGE_ME_SECRET",
+  "bind_ip": "0.0.0.0",
+  "public_host": "91.216.104.42",
+  "auth_token": "change-this-dashboard-token",
+  "ffmpeg_path": "ffmpeg\\bin\\ffmpeg.exe",
+  "destinations": [
+    {
+      "id": "twitch",
+      "platform": "twitch",
+      "title": "Twitch",
+      "enabled": true,
+      "rtmp_url": "rtmp://live.twitch.tv/app/YOUR_TWITCH_STREAM_KEY",
+      "channel": "your_twitch_login",
+      "oauth_token": "",
+      "client_id": ""
+    },
+    {
+      "id": "youtube",
+      "platform": "youtube",
+      "title": "YouTube",
+      "enabled": true,
+      "rtmp_url": "rtmp://a.rtmp.youtube.com/live2/YOUR_YOUTUBE_STREAM_KEY",
+      "channel": "YOUR_LIVE_VIDEO_ID",
+      "api_key": "",
+      "oauth_token": ""
+    },
+    {
+      "id": "kick",
+      "platform": "kick",
+      "title": "Kick",
+      "enabled": false,
+      "rtmp_url": "rtmps://fa723fc1b171.global-contribute.live-video.net/app/YOUR_KICK_KEY",
+      "channel": "your_kick_slug",
+      "oauth_token": ""
+    },
+    {
+      "id": "custom",
+      "platform": "custom",
+      "title": "Custom RTMP",
+      "enabled": false,
+      "rtmp_url": "rtmp://example.com/app/key",
+      "channel": ""
+    }
+  ]
+}

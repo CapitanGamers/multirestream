@@ -1,5 +1,7 @@
 ﻿#pragma once
 #include <string>
+#include <string_view>
+#include <charconv>
 #include <vector>
 #include <cstdint>
 #include <cstdio>
@@ -48,11 +50,12 @@ inline Platform PlatformFromId(const std::string& id) {
 }
 
 // Helper to convert "#RRGGBB" from server to COLORREF
-inline COLORREF ParseHexColor(const std::string& hex, COLORREF def = RGB(160,160,160)) {
+inline COLORREF ParseHexColor(std::string_view hex, COLORREF def = RGB(160,160,160)) {
     if (hex.size() == 7 && hex[0] == '#') {
-        int r, g, b;
-        if (sscanf(hex.c_str(), "#%02x%02x%02x", &r, &g, &b) == 3)
-            return RGB(r, g, b);
+        unsigned int v = 0;
+        auto [ptr, ec] = std::from_chars(hex.data() + 1, hex.data() + 7, v, 16);
+        if (ec == std::errc{} && ptr == hex.data() + 7)
+            return RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
     }
     return def;
 }
@@ -64,8 +67,8 @@ struct ChatMessage {
     std::int64_t ts_ms = 0;
     bool is_mod = false;
     bool is_sub = false;
-    std::string logo_text; // آیکون/متن تولید شده در سرور
-    std::string color_hex; // رنگ تولید شده در سرور
+    std::string logo_text;
+    std::string color_hex;
 };
 
 struct ViewerSnapshot {

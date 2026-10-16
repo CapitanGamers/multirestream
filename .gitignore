@@ -4,3 +4,13 @@ out/
 *.user
 logs/
 config.json
+build/
+dist/
+out/
+.vs/
+*.user
+logs/
+*.log
+config.json
+FolderScanner.ps1
+Folder_Contents_Report*.txt

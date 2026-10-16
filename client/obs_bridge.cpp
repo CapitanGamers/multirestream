@@ -53,6 +53,11 @@ ObsResult ObsConfigureAndStart(const std::string& host, int port,
     ws.SendText(set);
     std::string resp;
     ws.RecvText(resp);
+    if (resp.find("\"result\":true") == std::string::npos && resp.find("\"code\":100") == std::string::npos) {
+        r.ok = false;
+        r.detail = "OBS تنظیمات استریم را نپذیرفت: " + json::ExtractString(resp, "comment");
+        return r;
+    }
 
     if (start) {
         ws.SendText("{\"op\":6,\"d\":{\"requestType\":\"StartStream\",\"requestId\":\"2\"}}");

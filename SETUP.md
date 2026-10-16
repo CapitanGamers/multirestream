@@ -1,6 +1,6 @@
 # راهنمای نصب و راه‌اندازی MultiRestream
 
-سرور این پروژه باید روی VPS با آی‌پی **`91.216.104.42`** باشد.  
+سرور این پروژه باید روی VPS با آی‌پی **`YOUR_VPS_IP`** باشد.  
 کلاینت و OBS روی کامپیوتر خودت اجرا می‌شوند و به همین آی‌پی وصل می‌شوند.
 
 دو مسیر جدا وجود دارد:
@@ -17,7 +17,7 @@
 
 ## صفر. چیزهایی که لازم داری
 
-### روی VPS ویندوز (`91.216.104.42`)
+### روی VPS ویندوز (`YOUR_VPS_IP`)
 
 1. ویندوز Server با دسترسی RDP
 2. Visual Studio 2019 یا 2022 با workload  
@@ -79,13 +79,13 @@ build\Release\mr_client.exe     ← فقط روی کامپیوتر تو
   "ingest_app": "live",
   "ingest_key": "یک_رمز_قوی_که_فقط_خودت_بدانی",
   "bind_ip": "0.0.0.0",
-  "public_host": "91.216.104.42",
+  "public_host": "YOUR_VPS_IP",
   "auth_token": "توکن_داشبورد_قوی",
   "ffmpeg_path": "ffmpeg"
 }
 ```
 
-- `public_host` باید دقیقاً `91.216.104.42` باشد. اگر این خالی بماند کلاینت ممکن است IP داخلی بگیرد و OBS از خانه وصل نشود.
+- `public_host` باید دقیقاً `YOUR_VPS_IP` باشد. اگر این خالی بماند کلاینت ممکن است IP داخلی بگیرد و OBS از خانه وصل نشود.
 - `ingest_key` کلیدی است که OBS به **سرور تو** می‌فرستد، نه کلید توییچ.
 - `auth_token` رمزی است که کلاینت برای ورود به داشبورد می‌فرستد.
 
@@ -99,7 +99,7 @@ build\Release\mr_client.exe     ← فقط روی کامپیوتر تو
 5. در پنجره باید آدرس اینجست شبیه این دیده شود:
 
 ```
-rtmp://91.216.104.42:1935/live/یک_رمز_قوی_که_فقط_خودت_بدانی
+rtmp://YOUR_VPS_IP:1935/live/یک_رمز_قوی_که_فقط_خودت_بدانی
 ```
 
 لاگ فایل از همین لحظه اینجا نوشته می‌شود:
@@ -125,15 +125,15 @@ New-NetFirewallRule -DisplayName "MR RTMP 1935"    -Direction Inbound -Protocol 
 از کامپیوتر خودت تست کن:
 
 ```bat
-telnet 91.216.104.42 7788
-telnet 91.216.104.42 1935
+telnet YOUR_VPS_IP 7788
+telnet YOUR_VPS_IP 1935
 ```
 
 یا در PowerShell:
 
 ```powershell
-Test-NetConnection 91.216.104.42 -Port 7788
-Test-NetConnection 91.216.104.42 -Port 1935
+Test-NetConnection YOUR_VPS_IP -Port 7788
+Test-NetConnection YOUR_VPS_IP -Port 1935
 ```
 
 `TcpTestSucceeded : True` یعنی مسیر باز است.
@@ -149,7 +149,7 @@ Test-NetConnection 91.216.104.42 -Port 1935
 
 | فیلد | مقدار |
 |---|---|
-| سرور | `91.216.104.42` |
+| سرور | `YOUR_VPS_IP` |
 | پورت | `7788` |
 | توکن | همان `auth_token` داخل `config.json` سرور |
 
@@ -179,7 +179,7 @@ Test-NetConnection 91.216.104.42 -Port 1935
 OBS → Settings → Stream
 
 - Service: **Custom**
-- Server: `rtmp://91.216.104.42:1935/live`
+- Server: `rtmp://YOUR_VPS_IP:1935/live`
 - Stream Key: همان `ingest_key` سرور
 
 خروجی پیشنهادی: H.264 + AAC، CBR، کی‌فریم هر ۲ ثانیه.
@@ -219,9 +219,9 @@ scripts\start-chrome-debug.bat
 ## ۷. ترتیب یک استریم واقعی
 
 1. سرور روی VPS روشن + دکمه شروع  
-2. کلاینت به `91.216.104.42:7788` وصل  
+2. کلاینت به `YOUR_VPS_IP:7788` وصل  
 3. مقصدها روی سرور کلید معتبر دارند  
-4. OBS به `rtmp://91.216.104.42:1935/live` استریم می‌کند  
+4. OBS به `rtmp://YOUR_VPS_IP:1935/live` استریم می‌کند  
 5. در کلاینت کارت ویو و چت باید کم‌کم پر شود  
 
 پهنای باند آپلود VPS باید حداقل  
@@ -273,8 +273,8 @@ ffmpeg -listen 1 -i rtmp://0.0.0.0:1935/live/TESTKEY -c copy -f flv rtmp://live.
 ## ۹. چک‌لیست سریع وقتی «کار نمی‌کند»
 
 1. روی VPS: `logs\server-*.log` — آیا `file logger started` هست؟  
-2. آیا `public_host=91.216.104.42` در همان لاگ چاپ شده؟  
-3. از خانه: `Test-NetConnection 91.216.104.42 -Port 7788`  
+2. آیا `public_host=YOUR_VPS_IP` در همان لاگ چاپ شده؟  
+3. از خانه: `Test-NetConnection YOUR_VPS_IP -Port 7788`  
 4. کلاینت وصل می‌شود؟ در لاگ سرور باید `client connected from ...` بیاید  
 5. OBS استریم را زده؟ در `ffmpeg-*.log` باید Input ظاهر شود  
 6. مقصد در `config.json` `enabled: true` است و `rtmp_url` کلید واقعی دارد؟

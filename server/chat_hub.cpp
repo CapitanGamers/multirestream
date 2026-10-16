@@ -54,9 +54,10 @@ void ChatHub::Worker() {
         for (const auto& d : snap.destinations) {
             if (!d.enabled) continue;
             try {
-                if (d.platform == Platform::Twitch)  PollTwitch(d);
-                if (d.platform == Platform::YouTube) PollYouTube(d);
-                if (d.platform == Platform::Kick)    PollKick(d);
+                if (d.platform == Platform::Twitch)   PollTwitch(d);
+                if (d.platform == Platform::YouTube)  PollYouTube(d);
+                if (d.platform == Platform::Kick)     PollKick(d);
+                if (d.platform == Platform::Facebook) PollFacebook(d);
             } catch (...) {
                 if (log_) log_("poll exception on " + d.id);
             }
@@ -67,8 +68,9 @@ void ChatHub::Worker() {
 
 void ChatHub::PollTwitch(const Destination& d) {
     if (d.channel.empty()) return;
+    std::string cid = d.client_id.empty() ? "kimne78kx3ncx6brgo4mv6wki5h1ko" : d.client_id;
     std::wstring path = L"/helix/streams?user_login=" + Utf8ToWide(d.channel);
-    std::wstring hdr = L"Client-Id: " + Utf8ToWide(d.client_id) + L"\r\n";
+    std::wstring hdr = L"Client-Id: " + Utf8ToWide(cid) + L"\r\n";
     if (!d.oauth_token.empty()) {
         std::string tok = d.oauth_token;
         if (tok.rfind("oauth:", 0) == 0) tok = tok.substr(6);
@@ -82,11 +84,10 @@ void ChatHub::PollTwitch(const Destination& d) {
     ViewerSnapshot vs;
     vs.platform = Platform::Twitch;
     vs.name = d.title;
-    vs.dest_connected = true;
+    vs.dest_connected = (st >= 200 && st < 300);
     vs.live = body.find("\"type\":\"live\"") != std::string::npos || body.find("\"type\": \"live\"") != std::string::npos;
     vs.viewers = vs.live ? static_cast<int>(json::ExtractInt(body, "viewer_count", 0)) : 0;
-    vs.status = vs.live ? "live" : "offline";
-    if (st == 401 || st == 403) vs.status = "auth error";
+    vs.status = (st == 401 || st == 403) ? "auth error" : (vs.live ? "live" : "offline");
     if (on_view_) on_view_(vs);
 }
 
@@ -108,10 +109,17 @@ void ChatHub::PollYouTube(const Destination& d) {
 
     std::string chat_id = json::ExtractString(body, "activeLiveChatId");
     if (chat_id.empty()) return;
+    if (chat_id != yt_last_chat_id_) {
+        yt_last_chat_id_ = chat_id;
+        yt_next_page_token_.clear();
+    }
     std::wstring cpath = L"/youtube/v3/liveChat/messages?part=snippet,authorDetails&liveChatId="
                        + Utf8ToWide(chat_id) + L"&maxResults=20&key=" + Utf8ToWide(d.api_key);
+    if (!yt_next_page_token_.empty())
+        cpath += L"&pageToken=" + Utf8ToWide(yt_next_page_token_);
     std::string cbody; DWORD cst = 0;
     if (!HttpGet(L"www.googleapis.com", 443, true, cpath, L"", cbody, cst)) return;
+    yt_next_page_token_ = json::ExtractString(cbody, "nextPageToken");
     std::size_t p = 0;
     for (int n = 0; n < 8; ++n) {
         auto dn = cbody.find("\"displayName\"", p);
@@ -123,7 +131,7 @@ void ChatHub::PollYouTube(const Destination& d) {
         m.text = json::ExtractString(cbody.substr(dm, 400), "displayMessage");
         m.ts_ms = NowMs();
         m.logo_text = "YT";
-        m.color_hex = "#FF0000"; // رنگ قرمز یوتیوب
+        m.color_hex = "#FF0000";
         if (!m.text.empty() && on_chat_) on_chat_(m);
         p = (std::max)(dn, dm) + 16;
     }
@@ -145,6 +153,27 @@ void ChatHub::PollKick(const Destination& d) {
     if (on_view_) on_view_(vs);
 }
 
+void ChatHub::PollFacebook(const Destination& d) {
+    if (d.channel.empty() || d.oauth_token.empty()) return;
+    std::wstring path = L"/v19.0/" + Utf8ToWide(d.channel) +
+                        L"?fields=live_views,status&access_token=" + Utf8ToWide(d.oauth_token);
+    std::string body; DWORD st = 0;
+    if (!HttpGet(L"graph.facebook.com", 443, true, path, L"", body, st)) {
+        if (on_view_) on_view_({Platform::Facebook, d.title, -1, false, false, "http error"});
+        return;
+    }
+    ViewerSnapshot vs;
+    vs.platform = Platform::Facebook;
+    vs.name = d.title;
+    vs.dest_connected = true;
+    std::string status = json::ExtractString(body, "status");
+    vs.live = status == "LIVE_NOW";
+    vs.viewers = vs.live ? static_cast<int>(json::ExtractInt(body, "live_views", 0)) : 0;
+    vs.status = vs.live ? "live" : (status.empty() ? "offline" : status);
+    if (st == 400 || st == 401 || st == 403) vs.status = "auth error";
+    if (on_view_) on_view_(vs);
+}
+
 static bool SockSendAll(SOCKET s, const char* p, int n) {
     int sent = 0;
     while (sent < n) {
@@ -161,7 +190,7 @@ void ChatHub::TwitchIrcOnce(const Destination& d, std::atomic<bool>& run) {
     if (getaddrinfo("irc.chat.twitch.tv", "6667", &hints, &res) != 0) return;
     SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { freeaddrinfo(res); return; }
-    DWORD timeout = 15000;
+    DWORD timeout = 2000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) { closesocket(s); freeaddrinfo(res); return; }
     freeaddrinfo(res);
@@ -178,9 +207,22 @@ void ChatHub::TwitchIrcOnce(const Destination& d, std::atomic<bool>& run) {
     if (!SockSendAll(s, hello.data(), (int)hello.size())) { closesocket(s); return; }
 
     std::string acc; char buf[2048];
+    std::int64_t last_rx = NowMs();
     while (run.load()) {
         int n = recv(s, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n < 0) {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                if (NowMs() - last_rx > 45000) {
+                    if (!SockSendAll(s, "PING :keepalive\r\n", 17)) break;
+                    last_rx = NowMs();
+                }
+                continue;
+            }
+            break;
+        }
+        if (n == 0) break;
+        last_rx = NowMs();
         acc.append(buf, n);
         std::size_t nl;
         while ((nl = acc.find("\r\n")) != std::string::npos) {
@@ -218,10 +260,8 @@ void ChatHub::TwitchIrcOnce(const Destination& d, std::atomic<bool>& run) {
             m.ts_ms = NowMs();
             m.is_mod = line.find("mod=1") != std::string::npos;
             m.is_sub = line.find("subscriber=1") != std::string::npos;
-            
-            // تولید رنگ و لوگو در سرور!
             m.logo_text = "TW";
-            m.color_hex = "#9146FF"; // رنگ بنفش توییچ
+            m.color_hex = "#9146FF";
 
             if (on_chat_) on_chat_(m);
         }

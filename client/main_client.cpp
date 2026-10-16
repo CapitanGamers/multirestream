@@ -44,9 +44,12 @@ using namespace mr;
 #define IDC_ACCOUNTS    327
 #define IDC_PUSH_KEYS   328
 #define IDC_LAUNCH_CH   329
+#define IDC_FULLSCREEN  330
 
 #define WM_APP_LINE     (WM_APP + 10)
 #define WM_APP_CONN     (WM_APP + 11)
+
+static const int kReconnectTimerId = 2;
 
 static HWND g_wnd = nullptr;
 static HWND g_chat = nullptr;
@@ -63,10 +66,22 @@ static HFONT g_font = nullptr;
 static HFONT g_font_big = nullptr;
 static HFONT g_font_chat = nullptr;
 static int g_pt = 14;
+static HACCEL g_accel = nullptr;
 
 static SOCKET g_sock = INVALID_SOCKET;
 static std::atomic<bool> g_run{false};
 static std::thread g_rx;
+
+static bool g_want_connected = false;
+static int g_reconnect_delay_ms = 3000;
+
+static bool g_high_contrast = false;
+static bool g_fullscreen = false;
+static WINDOWPLACEMENT g_prev_placement = { sizeof(WINDOWPLACEMENT) };
+
+static bool g_srv_running = false;
+static bool g_srv_publisher = false;
+static double g_srv_kbps = 0.0;
 
 struct ViewCard {
     Platform platform = Platform::Unknown;
@@ -96,6 +111,27 @@ static COLORREF C_BTN_PRM_DN = RGB(71, 82, 196);
 static COLORREF C_BTN_SEC    = RGB(78, 80, 88);
 static COLORREF C_BTN_SEC_DN = RGB(104, 109, 115);
 
+static void RecalcAllChatHeights() {
+    if (!g_chat) return;
+    RECT rc{}; GetClientRect(g_chat, &rc);
+    int text_w = (std::max)(180L, (rc.right - rc.left) - (g_pt + 68));
+    HDC dc = GetDC(g_chat);
+    HGDIOBJ old_f = SelectObject(dc, g_font_chat);
+    std::lock_guard<std::mutex> g(g_mu);
+    int count = static_cast<int>(g_msgs.size());
+    for (int i = 0; i < count; ++i) {
+        const auto& m = g_msgs[i];
+        RECT calc{ 0, 0, text_w, 0 };
+        std::wstring full = Utf8ToWide(m.user + ":   " + m.text);
+        DrawTextW(dc, full.c_str(), -1, &calc, DT_CALCRECT | DT_WORDBREAK);
+        int h = (std::max)(g_pt + 26, static_cast<int>(calc.bottom - calc.top) + 16);
+        SendMessageW(g_chat, LB_SETITEMHEIGHT, static_cast<WPARAM>(i), static_cast<LPARAM>(h));
+    }
+    SelectObject(dc, old_f);
+    ReleaseDC(g_chat, dc);
+    InvalidateRect(g_chat, nullptr, TRUE);
+}
+
 static void RecreateFonts() {
     if (g_font) DeleteObject(g_font);
     if (g_font_big) DeleteObject(g_font_big);
@@ -103,16 +139,74 @@ static void RecreateFonts() {
     g_font = MakeFont(g_pt, false);
     g_font_big = MakeFont(g_pt + 8, true);
     g_font_chat = MakeFont(g_pt + 2, false);
-    if (g_chat) {
-        SetWindowFont(g_chat, g_font_chat);
-        SendMessageW(g_chat, LB_SETITEMHEIGHT, 0, g_pt + 22);
+    if (g_chat) SetWindowFont(g_chat, g_font_chat);
+    RecalcAllChatHeights();
+    if (g_wnd) InvalidateRect(g_wnd, nullptr, TRUE);
+}
+
+static void ToggleContrast() {
+    g_high_contrast = !g_high_contrast;
+    if (g_high_contrast) {
+        C_BG = RGB(0, 0, 0);
+        C_PANEL = RGB(18, 18, 18);
+        C_TEXT = RGB(255, 255, 255);
+        C_TEXT_DIM = RGB(225, 225, 225);
+    } else {
+        C_BG = RGB(24, 25, 28);
+        C_PANEL = RGB(43, 45, 49);
+        C_TEXT = RGB(242, 243, 245);
+        C_TEXT_DIM = RGB(148, 155, 164);
     }
     if (g_wnd) InvalidateRect(g_wnd, nullptr, TRUE);
+}
+
+static void ToggleFullscreen(HWND h) {
+    LONG style = GetWindowLongW(h, GWL_STYLE);
+    if (!g_fullscreen) {
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetWindowPlacement(h, &g_prev_placement) &&
+            GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongW(h, GWL_STYLE, style & ~(LONG)WS_OVERLAPPEDWINDOW);
+            SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                        mi.rcMonitor.right - mi.rcMonitor.left,
+                        mi.rcMonitor.bottom - mi.rcMonitor.top,
+                        SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            g_fullscreen = true;
+        }
+    } else {
+        SetWindowLongW(h, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &g_prev_placement);
+        SetWindowPos(h, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = false;
+    }
 }
 
 static void SetStatus(const wchar_t* s) {
     Logger::I().Info("ui", WideToUtf8(s ? s : L""));
     if (g_status) SetWindowTextW(g_status, s);
+}
+
+static void UpdateTitleBadge() {
+    if (!g_wnd) return;
+    std::wstring t = L"داشبورد مدیریت لایو استریم";
+    if (g_srv_running) {
+        if (g_srv_publisher) {
+            wchar_t b[64];
+            swprintf(b, 64, L" — پخش زنده (%.1f Mbps)", g_srv_kbps / 1000.0);
+            t += b;
+        } else {
+            t += L" — در انتظار OBS";
+        }
+    }
+    SetWindowTextW(g_wnd, t.c_str());
+}
+
+static void ScheduleReconnect() {
+    if (!g_want_connected || !g_wnd) return;
+    SetStatus(L"ارتباط قطع شد — تلاش مجدد خودکار...");
+    SetTimer(g_wnd, kReconnectTimerId, g_reconnect_delay_ms, nullptr);
+    g_reconnect_delay_ms = (std::min)(30000, g_reconnect_delay_ms * 2);
 }
 
 static void SendLine(const std::string& json) {
@@ -184,7 +278,17 @@ static void ApplyLine(const std::string& line) {
         return;
     }
     if (type == "state") {
+        g_srv_running = json::ExtractBool(line, "running", false);
+        g_srv_publisher = json::ExtractBool(line, "publisher", false);
+        g_srv_kbps = (double)json::ExtractInt(line, "kbps", 0);
+        UpdateTitleBadge();
         SetStatus(L"متصل — وضعیت همگام شد");
+    }
+    if (type == "engine") {
+        g_srv_running = json::ExtractBool(line, "running", false);
+        g_srv_publisher = json::ExtractBool(line, "publisher", false);
+        g_srv_kbps = (double)json::ExtractInt(line, "kbps", 0);
+        UpdateTitleBadge();
     }
     if (type == "auth_ok") {
         bool ok = json::ExtractBool(line, "ok", false);
@@ -222,7 +326,7 @@ static void RxLoop() {
     PostMessageW(g_wnd, WM_APP_CONN, 0, 0);
 }
 
-static void Disconnect() {
+static void Disconnect(bool user_initiated = true) {
     g_run.store(false);
     if (g_sock != INVALID_SOCKET) {
         shutdown(g_sock, SD_BOTH);
@@ -231,11 +335,15 @@ static void Disconnect() {
     }
     if (g_rx.joinable() && g_rx.get_id() != std::this_thread::get_id())
         g_rx.join();
-    SetStatus(L"قطع شد");
+    if (user_initiated) {
+        g_want_connected = false;
+        if (g_wnd) KillTimer(g_wnd, kReconnectTimerId);
+        SetStatus(L"قطع شد");
+    }
 }
 
 static void Connect() {
-    Disconnect();
+    Disconnect(false);
     wchar_t hostw[256], portw[32], tokw[256];
     GetWindowTextW(g_host, hostw, 256);
     GetWindowTextW(g_port, portw, 32);
@@ -252,6 +360,7 @@ static void Connect() {
     addrinfo* res = nullptr;
     if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) {
         SetStatus(L"DNS / آدرس نامعتبر");
+        ScheduleReconnect();
         return;
     }
     SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
@@ -260,9 +369,12 @@ static void Connect() {
 
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
         SetStatus(L"اتصال برقرار نشد — فایروال سرور را چک کنید");
-        closesocket(s); freeaddrinfo(res); return;
+        closesocket(s); freeaddrinfo(res);
+        ScheduleReconnect();
+        return;
     }
     freeaddrinfo(res);
+    g_reconnect_delay_ms = 3000;
     g_sock = s;
     g_run.store(true);
     g_rx = std::thread(RxLoop);
@@ -348,8 +460,27 @@ static void DrawViewCards(HDC dc, RECT area) {
     }
 }
 
+static int DrawPillBadge(HDC dc, int x, int y, int h, const wchar_t* label, COLORREF bg_col, COLORREF txt_col) {
+    SelectObject(dc, g_font);
+    RECT calc{ 0, 0, 200, h };
+    DrawTextW(dc, label, -1, &calc, DT_CALCRECT | DT_SINGLELINE);
+    int w = (calc.right - calc.left) + 12;
+    RECT pill{ x, y + 2, x + w, y + h - 2 };
+    HBRUSH br = CreateSolidBrush(bg_col);
+    HPEN pen = CreatePen(PS_SOLID, 1, bg_col);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom, 6, 6);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(br); DeleteObject(pen);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, txt_col);
+    DrawTextW(dc, label, -1, &pill, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    return w + 6;
+}
+
 static void DrawChatItem(DRAWITEMSTRUCT* dis) {
-    if (dis->itemID == (UINT)-1) return;
+    if (dis->itemID == static_cast<UINT>(-1)) return;
     ChatMessage m;
     {
         std::lock_guard<std::mutex> g(g_mu);
@@ -359,27 +490,36 @@ static void DrawChatItem(DRAWITEMSTRUCT* dis) {
     HDC dc = dis->hDC;
     RECT r = dis->rcItem;
     bool sel = (dis->itemState & ODS_SELECTED) != 0;
-    HBRUSH br = CreateSolidBrush(sel ? RGB(53, 55, 63) : C_PANEL);
+    COLORREF row_bg = sel ? RGB(42, 48, 66) : ((dis->itemID % 2 == 0) ? C_PANEL : RGB(36, 38, 44));
+    HBRUSH br = CreateSolidBrush(row_bg);
     FillRect(dc, &r, br);
     DeleteObject(br);
 
-    RECT badge{ r.left + 12, r.top + 8, r.left + 12 + (g_pt + 12), r.bottom - 8 };
+    int badge_sz = g_pt + 12;
+    RECT badge{ r.left + 10, r.top + 6, r.left + 10 + badge_sz, r.top + 6 + badge_sz };
     DrawLogoBadge(dc, badge, m.platform);
+
+    int cur_x = badge.right + 10;
+    int line_h = g_pt + 10;
+    if (m.is_mod) cur_x += DrawPillBadge(dc, cur_x, r.top + 6, line_h, L"MOD", RGB(16, 185, 129), RGB(10, 25, 20));
+    if (m.is_sub) cur_x += DrawPillBadge(dc, cur_x, r.top + 6, line_h, L"SUB", RGB(139, 92, 246), RGB(255, 255, 255));
 
     SetBkMode(dc, TRANSPARENT);
     SelectObject(dc, g_font_chat);
+    std::wstring user_str = Utf8ToWide(m.user) + L": ";
+    SetTextColor(dc, PlatformColor(static_cast<int>(m.platform)));
+    RECT u_calc{ cur_x, r.top + 6, r.right - 12, r.top + 6 + line_h };
+    DrawTextW(dc, user_str.c_str(), -1, &u_calc, DT_CALCRECT | DT_SINGLELINE);
+    DrawTextW(dc, user_str.c_str(), -1, &u_calc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    RECT pr{ badge.right + 12, r.top + 2, r.right - 12, r.bottom - 2 };
-    std::wstring user = Utf8ToWide(m.user);
-    std::wstring text = Utf8ToWide(m.text);
-    std::wstring line = user;
-    if (m.is_mod) line += L" [M]";
-    if (m.is_sub) line += L" [S]";
-    line += L"   ";
-    line += text;
-
+    std::wstring msg_str = Utf8ToWide(m.text);
     SetTextColor(dc, C_TEXT);
-    DrawTextW(dc, line.c_str(), -1, &pr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT m_rc{ u_calc.right + 4, r.top + 6, r.right - 12, r.bottom - 6 };
+    if (m_rc.right - m_rc.left < 120) {
+        m_rc.left = badge.right + 10;
+        m_rc.top += line_h + 2;
+    }
+    DrawTextW(dc, msg_str.c_str(), -1, &m_rc, DT_LEFT | DT_TOP | DT_WORDBREAK);
 }
 
 static void DrawModernButton(DRAWITEMSTRUCT* di) {
@@ -455,51 +595,80 @@ static void DoObs() {
 
 static void Layout(HWND h) {
     RECT rc; GetClientRect(h, &rc);
-    const int m = 20;
-    int y = m;
-    
-    MoveWindow(GetDlgItem(h, 400), m, y + 8, 50, 24, TRUE);
-    MoveWindow(g_host, m + 54, y, 200, 36, TRUE);
-    MoveWindow(GetDlgItem(h, 401), m + 270, y + 8, 40, 24, TRUE);
-    MoveWindow(g_port, m + 314, y, 70, 36, TRUE);
-    MoveWindow(GetDlgItem(h, 402), m + 400, y + 8, 40, 24, TRUE);
-    MoveWindow(g_token, m + 444, y, 200, 36, TRUE);
-    
-    MoveWindow(GetDlgItem(h, IDC_CONNECT), rc.right - m - 230, y, 110, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_DISCONNECT), rc.right - m - 110, y, 110, 36, TRUE);
-    y += 50;
-    
-    MoveWindow(g_status, m, y, rc.right - 2 * m, 24, TRUE);
-    y += 36;
-    
-    MoveWindow(GetDlgItem(h, 410), m, y + 8, 80, 24, TRUE);
-    MoveWindow(g_ingest, m + 84, y, rc.right - m - 460, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_COPY_INGEST), rc.right - m - 360, y, 90, 36, TRUE);
-    
-    MoveWindow(GetDlgItem(h, 411), rc.right - m - 250, y + 8, 40, 24, TRUE);
-    MoveWindow(g_obs_pass, rc.right - m - 200, y, 90, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_OBS_PUSH), rc.right - m - 100, y, 100, 36, TRUE);
-    y += 50;
-    
-    MoveWindow(GetDlgItem(h, 412), m, y + 8, 80, 24, TRUE);
-    MoveWindow(g_title, m + 84, y, rc.right - m - 550, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_APPLY_TITLE), rc.right - m - 450, y, 120, 36, TRUE);
-    
-    MoveWindow(GetDlgItem(h, IDC_LAUNCH_CH), rc.right - m - 320, y, 100, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_CHROME), rc.right - m - 210, y, 100, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_PUSH_KEYS), rc.right - m - 100, y, 100, 36, TRUE);
-    y += 50;
-    
-    MoveWindow(g_accounts, m, y, rc.right - 2 * m, 100, TRUE);
-    y += 116;
-    
-    int cards_h = 140;
-    MoveWindow(g_view, m, y, rc.right - 2 * m, cards_h, TRUE);
-    y += cards_h + 16;
-    
-    MoveWindow(GetDlgItem(h, 403), m, y, 300, 24, TRUE);
-    y += 30;
-    MoveWindow(g_chat, m, y, rc.right - 2 * m, rc.bottom - y - m, TRUE);
+    const int pad = 16;
+    const int side_w = 400;
+    int side_x = rc.right - side_w - pad;
+    int main_w = side_x - pad * 2;
+
+    // top bar
+    int top_y = 8;
+    MoveWindow(GetDlgItem(h, IDC_FULLSCREEN), pad, top_y, 34, 26, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_CONTRAST), pad + 38, top_y, 34, 26, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_FONTMINUS), pad + 76, top_y, 34, 26, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_FONTPLUS), pad + 114, top_y, 34, 26, TRUE);
+    MoveWindow(g_status, pad + 156, top_y + 2, main_w - 156, 22, TRUE);
+
+    // main canvas
+    int main_y = 42;
+    int cards_h = 110;
+    MoveWindow(g_view, pad, main_y, main_w, cards_h, TRUE);
+    main_y += cards_h + 8;
+    MoveWindow(GetDlgItem(h, 403), pad, main_y, main_w, 20, TRUE);
+    main_y += 24;
+    MoveWindow(g_chat, pad, main_y, main_w, rc.bottom - main_y - pad, TRUE);
+
+    // sidebar
+    int sx = side_x + 10;
+    int sw = side_w - 20;
+    int sy = 42;
+
+    // server + port row
+    MoveWindow(GetDlgItem(h, 400), sx, sy, 40, 20, TRUE);
+    MoveWindow(g_host, sx + 44, sy, sw - 130, 28, TRUE);
+    MoveWindow(GetDlgItem(h, 401), sx + sw - 78, sy, 32, 20, TRUE);
+    MoveWindow(g_port, sx + sw - 42, sy, 42, 28, TRUE);
+    sy += 34;
+
+    // token
+    MoveWindow(GetDlgItem(h, 402), sx, sy, 40, 20, TRUE);
+    MoveWindow(g_token, sx + 44, sy, sw - 44, 28, TRUE);
+    sy += 36;
+
+    // connect buttons
+    int half = (sw - 6) / 2;
+    MoveWindow(GetDlgItem(h, IDC_CONNECT), sx, sy, half, 30, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_DISCONNECT), sx + half + 6, sy, half, 30, TRUE);
+    sy += 42;
+
+    // OBS link
+    MoveWindow(GetDlgItem(h, 410), sx, sy, sw, 18, TRUE);
+    sy += 20;
+    MoveWindow(g_ingest, sx, sy, sw - 86, 28, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_COPY_INGEST), sx + sw - 80, sy, 80, 28, TRUE);
+    sy += 34;
+
+    // OBS pass
+    MoveWindow(GetDlgItem(h, 411), sx, sy, 50, 20, TRUE);
+    MoveWindow(g_obs_pass, sx + 54, sy, sw - 150, 28, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_OBS_PUSH), sx + sw - 90, sy, 90, 28, TRUE);
+    sy += 40;
+
+    // title
+    MoveWindow(GetDlgItem(h, 412), sx, sy, sw, 18, TRUE);
+    sy += 20;
+    MoveWindow(g_title, sx, sy, sw - 100, 28, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_APPLY_TITLE), sx + sw - 94, sy, 94, 28, TRUE);
+    sy += 36;
+
+    // chrome buttons
+    int third = (sw - 10) / 3;
+    MoveWindow(GetDlgItem(h, IDC_LAUNCH_CH), sx, sy, third, 30, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_CHROME), sx + third + 5, sy, third, 30, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_PUSH_KEYS), sx + 2 * (third + 5), sy, third, 30, TRUE);
+    sy += 36;
+
+    MoveWindow(g_accounts, sx, sy, sw, (std::max)(60L, rc.bottom - sy - pad - 6), TRUE);
+    RecalcAllChatHeights();
 }
 
 static LRESULT CALLBACK ViewProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -522,13 +691,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         RecreateFonts();
 
         auto lab = [&](const wchar_t* t, int id) {
-            HWND c = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
+            HWND c = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_RIGHT,
                                      0, 0, 10, 10, h, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
             SetWindowFont(c, g_font); return c;
         };
         auto ed = [&](int id, const wchar_t* v, DWORD extra = 0) {
             HWND c = CreateWindowExW(0, L"EDIT", v,
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER | extra,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra,
                                      0, 0, 10, 10, h, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
             SetWindowFont(c, g_font); return c;
         };
@@ -539,12 +708,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
-        lab(L"سرور", 400); g_host = ed(IDC_HOST, L"91.216.104.42");
+        lab(L"سرور", 400); g_host = ed(IDC_HOST, L"");
         lab(L"پورت", 401); g_port = ed(IDC_PORT, L"7788");
-        lab(L"توکن", 402); g_token = ed(IDC_TOKEN, L"change-this-dashboard-token", ES_PASSWORD);
+        lab(L"توکن", 402); g_token = ed(IDC_TOKEN, L"", ES_PASSWORD);
         
-        btn(L"اتصال به سرور", IDC_CONNECT); btn(L"قطع ارتباط", IDC_DISCONNECT);
-        g_status = lab(L"آماده...", IDC_STATUS);
+        btn(L"اتصال", IDC_CONNECT); btn(L"قطع", IDC_DISCONNECT);
+        g_status = CreateWindowExW(0, L"STATIC", L"آماده...", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     0, 0, 10, 10, h, (HMENU)IDC_STATUS, GetModuleHandleW(nullptr), nullptr);
+        SetWindowFont(g_status, g_font);
+
+        btn(L"A-", IDC_FONTMINUS);
+        btn(L"A+", IDC_FONTPLUS);
+        btn(L"◐", IDC_CONTRAST);
+        btn(L"⛶", IDC_FULLSCREEN);
 
         lab(L"لینک OBS", 410); g_ingest = ed(IDC_INGEST_BOX, L""); SendMessageW(g_ingest, EM_SETREADONLY, TRUE, 0);
         btn(L"کپی لینک", IDC_COPY_INGEST);
@@ -553,10 +729,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 
         lab(L"عنوان لایو", 412); g_title = ed(IDC_TITLE, L"");
         btn(L"تغییر عنوان", IDC_APPLY_TITLE);
-        btn(L"اجرای مرورگر", IDC_LAUNCH_CH); btn(L"خواندن اطلاعات", IDC_CHROME); btn(L"ارسال به سرور", IDC_PUSH_KEYS);
+        btn(L"کروم", IDC_LAUNCH_CH); btn(L"خواندن", IDC_CHROME); btn(L"ارسال", IDC_PUSH_KEYS);
 
         g_accounts = CreateWindowExW(0, L"LISTBOX", L"",
-                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER,
+                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL,
                                      0, 0, 10, 10, h, (HMENU)IDC_ACCOUNTS, GetModuleHandleW(nullptr), nullptr);
         SetWindowFont(g_accounts, g_font);
 
@@ -566,17 +742,35 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         g_view = CreateWindowExW(0, L"MRViewPanel", L"", WS_CHILD | WS_VISIBLE,
                                  0, 0, 10, 10, h, (HMENU)IDC_VIEWPANEL, GetModuleHandleW(nullptr), nullptr);
 
-        lab(L"پیامهای زنده تماشاگران", 403);
+        lab(L"چت زنده تماشاگران", 403);
         g_chat = CreateWindowExW(0, L"LISTBOX", L"",
-                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | WS_BORDER |
-                                 LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
+                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
+                                 LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
                                  0, 0, 10, 10, h, (HMENU)IDC_CHAT, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(g_chat, LB_SETITEMHEIGHT, 0, g_pt + 22);
         return 0;
     }
     case WM_MEASUREITEM: {
         auto* mi = (MEASUREITEMSTRUCT*)l;
-        if (mi->CtlID == IDC_CHAT) { mi->itemHeight = g_pt + 22; return TRUE; }
+        if (mi->CtlID == IDC_CHAT && g_chat) {
+            std::lock_guard<std::mutex> g(g_mu);
+            if (mi->itemID < g_msgs.size()) {
+                const auto& m = g_msgs[mi->itemID];
+                RECT rcClient{}; GetClientRect(g_chat, &rcClient);
+                int text_w = (std::max)(200L, (rcClient.right - rcClient.left) - (g_pt + 60));
+                HDC dc = GetDC(g_chat);
+                HGDIOBJ of = SelectObject(dc, g_font_chat);
+                RECT calc{ 0, 0, text_w, 0 };
+                std::wstring full = Utf8ToWide(m.user + ": " + m.text);
+                DrawTextW(dc, full.c_str(), -1, &calc, DT_CALCRECT | DT_WORDBREAK);
+                SelectObject(dc, of);
+                ReleaseDC(g_chat, dc);
+                mi->itemHeight = (std::max)(g_pt + 26, (int)(calc.bottom - calc.top) + 16);
+                return TRUE;
+            }
+            mi->itemHeight = g_pt + 26;
+            return TRUE;
+        }
         break;
     }
     case WM_DRAWITEM: {
@@ -584,6 +778,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         if (di->CtlType == ODT_LISTBOX && di->CtlID == IDC_CHAT) { DrawChatItem(di); return TRUE; }
         if (di->CtlType == ODT_BUTTON) { DrawModernButton(di); return TRUE; }
         break;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        HBRUSH bg = CreateSolidBrush(C_BG);
+        FillRect(dc, &rc, bg);
+        DeleteObject(bg);
+        EndPaint(h, &ps);
+        return 0;
     }
     case WM_SIZE: Layout(h); InvalidateRect(g_view, nullptr, FALSE); return 0;
     case WM_GETMINMAXINFO: { ((MINMAXINFO*)l)->ptMinTrackSize = { 1100, 720 }; return 0; }
@@ -593,14 +797,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         HDC dc = (HDC)w;
         SetBkColor(dc, C_PANEL);
         SetTextColor(dc, C_TEXT);
-        static HBRUSH br = CreateSolidBrush(C_PANEL);
+        static HBRUSH br = nullptr;
+        static COLORREF last = (COLORREF)-1;
+        if (!br || last != C_PANEL) { if (br) DeleteObject(br); br = CreateSolidBrush(C_PANEL); last = C_PANEL; }
         return (LRESULT)br;
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
         SetBkColor(dc, C_BG);
         SetTextColor(dc, C_TEXT_DIM);
-        static HBRUSH br = CreateSolidBrush(C_BG);
+        static HBRUSH br = nullptr;
+        static COLORREF last = (COLORREF)-1;
+        if (!br || last != C_BG) { if (br) DeleteObject(br); br = CreateSolidBrush(C_BG); last = C_BG; }
         return (LRESULT)br;
     }
     case WM_ERASEBKGND: {
@@ -612,13 +820,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     case WM_COMMAND: {
         int id = LOWORD(w);
-        if (id == IDC_CONNECT) Connect();
-        if (id == IDC_DISCONNECT) Disconnect();
+        if (id == IDC_CONNECT) { g_want_connected = true; g_reconnect_delay_ms = 3000; Connect(); }
+        if (id == IDC_DISCONNECT) Disconnect(true);
         if (id == IDC_CHROME) DoChrome();
         if (id == IDC_LAUNCH_CH) LaunchChromeDebug(9333);
         if (id == IDC_PUSH_KEYS) DoPushKeys();
         if (id == IDC_APPLY_TITLE) DoApplyTitle();
         if (id == IDC_OBS_PUSH) DoObs();
+        if (id == IDC_FONTPLUS) { g_pt = (std::min)(28, g_pt + 2); RecreateFonts(); Layout(h); }
+        if (id == IDC_FONTMINUS) { g_pt = (std::max)(12, g_pt - 2); RecreateFonts(); Layout(h); }
+        if (id == IDC_CONTRAST) ToggleContrast();
+        if (id == IDC_FULLSCREEN) ToggleFullscreen(h);
         if (id == IDC_COPY_INGEST && g_ingest) {
             int n = GetWindowTextLengthW(g_ingest);
             std::wstring t(n, 0); GetWindowTextW(g_ingest, t.data(), n + 1);
@@ -632,9 +844,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_TIMER:
+        if (w == (WPARAM)kReconnectTimerId) {
+            KillTimer(h, kReconnectTimerId);
+            if (g_want_connected) Connect();
+        }
+        return 0;
     case WM_APP_LINE: { auto* s = reinterpret_cast<std::string*>(l); if (s) { ApplyLine(*s); delete s; } return 0; }
-    case WM_APP_CONN: SetStatus(L"ارتباط با سرور قطع شد"); return 0;
-    case WM_DESTROY: Disconnect(); PostQuitMessage(0); return 0;
+    case WM_APP_CONN:
+        SetStatus(L"ارتباط با سرور قطع شد");
+        g_srv_running = false; g_srv_publisher = false; UpdateTitleBadge();
+        ScheduleReconnect();
+        return 0;
+    case WM_DESTROY: KillTimer(h, kReconnectTimerId); Disconnect(true); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(h, msg, w, l);
 }
@@ -646,14 +868,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = CreateSolidBrush(C_BG);
     wc.lpszClassName = L"MRClient"; RegisterClassW(&wc);
 
-    g_wnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_LAYOUTRTL | WS_EX_COMPOSITED, wc.lpszClassName,
+    g_wnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_COMPOSITED, wc.lpszClassName,
                             L"داشبورد مدیریت لایو استریم", WS_OVERLAPPEDWINDOW,
                             CW_USEDEFAULT, CW_USEDEFAULT, 1200, 780, nullptr, nullptr, inst, nullptr);
     
     BOOL dark = TRUE; DwmSetWindowAttribute(g_wnd, 20, &dark, sizeof(dark));
     DWORD corner = 2; DwmSetWindowAttribute(g_wnd, 33, &corner, sizeof(corner));
 
+    ACCEL accels[] = {
+        { FVIRTKEY | FCONTROL, VK_OEM_PLUS,  IDC_FONTPLUS },
+        { FVIRTKEY | FCONTROL, VK_OEM_MINUS, IDC_FONTMINUS },
+        { FVIRTKEY,            VK_F11,       IDC_FULLSCREEN },
+    };
+    g_accel = CreateAcceleratorTableW(accels, 3);
+
     ShowWindow(g_wnd, show);
-    MSG msg; while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (!g_accel || !TranslateAcceleratorW(g_wnd, g_accel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (g_accel) DestroyAcceleratorTable(g_accel);
     WSACleanup(); return 0;
 }

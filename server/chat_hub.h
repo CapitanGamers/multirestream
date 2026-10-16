@@ -30,6 +30,7 @@ private:
     void PollTwitch(const Destination& d);
     void PollYouTube(const Destination& d);
     void PollKick(const Destination& d);
+    void PollFacebook(const Destination& d);
     void TwitchIrcOnce(const Destination& d, std::atomic<bool>& run);
 
     ChatFn on_chat_;
@@ -40,6 +41,8 @@ private:
     std::atomic<bool> run_{false};
     std::thread worker_;
     std::thread irc_thread_;
+    std::string yt_next_page_token_;
+    std::string yt_last_chat_id_;
 };
 
 } // namespace mr

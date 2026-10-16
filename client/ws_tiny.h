@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <sstream>
 #include <cstring>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 namespace mr {
 
@@ -35,9 +37,8 @@ public:
         }
         freeaddrinfo(res);
 
-        // Random-ish key
         unsigned char raw[16];
-        for (int i = 0; i < 16; ++i) raw[i] = (unsigned char)(GetTickCount() * 17 + i * 31);
+        BCryptGenRandom(nullptr, raw, sizeof(raw), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         std::string key = Base64Encode(raw, 16);
         std::ostringstream req;
         req << "GET " << path << " HTTP/1.1\r\n"
@@ -49,7 +50,7 @@ public:
             << "Origin: http://" << host << "\r\n"
             << "\r\n";
         auto hs = req.str();
-        if (send(s, hs.data(), (int)hs.size(), 0) <= 0) { Close(); return false; }
+        if (!SendAll(hs.data(), (int)hs.size())) { Close(); return false; }
         std::string acc;
         char buf[2048];
         while (acc.find("\r\n\r\n") == std::string::npos) {
@@ -62,81 +63,116 @@ public:
     }
 
     bool SendText(const std::string& msg) {
-        if (s == INVALID_SOCKET) return false;
-        std::vector<unsigned char> frame;
-        frame.push_back(0x81);
-        uint64_t n = msg.size();
-        unsigned char mask[4] = { 0xA5, 0x5A, 0x3C, 0xC3 };
-        if (n < 126) {
-            frame.push_back((unsigned char)(0x80 | n));
-        } else if (n <= 0xFFFF) {
-            frame.push_back(0x80 | 126);
-            frame.push_back((unsigned char)(n >> 8));
-            frame.push_back((unsigned char)(n));
-        } else {
-            frame.push_back(0x80 | 127);
-            for (int i = 7; i >= 0; --i) frame.push_back((unsigned char)(n >> (8 * i)));
-        }
-        frame.insert(frame.end(), mask, mask + 4);
-        for (size_t i = 0; i < msg.size(); ++i)
-            frame.push_back((unsigned char)msg[i] ^ mask[i & 3]);
-        return send(s, (char*)frame.data(), (int)frame.size(), 0) == (int)frame.size();
+        return SendRawFrame(0x1, msg.data(), msg.size());
     }
 
     bool RecvText(std::string& out, int max_wait_loops = 40) {
         out.clear();
-        std::string acc;
         char buf[4096];
         for (int i = 0; i < max_wait_loops; ++i) {
+            if (TryParse(out)) return true;
             int n = recv(s, buf, sizeof(buf), 0);
             if (n <= 0) return !out.empty();
-            acc.append(buf, n);
-            if (TryParse(acc, out)) return true;
+            rx_acc_.append(buf, n);
+            if (TryParse(out)) return true;
         }
         return !out.empty();
     }
 
     void Close() {
         if (s != INVALID_SOCKET) { closesocket(s); s = INVALID_SOCKET; }
+        rx_acc_.clear();
     }
 
     ~TinyWs() { Close(); }
 
 private:
-    static bool TryParse(std::string& acc, std::string& out) {
-        if (acc.size() < 2) return false;
-        auto* p = (const unsigned char*)acc.data();
-        bool fin = (p[0] & 0x80) != 0;
-        int opcode = p[0] & 0x0F;
-        bool masked = (p[1] & 0x80) != 0;
-        uint64_t len = p[1] & 0x7F;
-        size_t off = 2;
-        if (len == 126) {
-            if (acc.size() < 4) return false;
-            len = (p[2] << 8) | p[3];
-            off = 4;
-        } else if (len == 127) {
-            if (acc.size() < 10) return false;
-            len = 0;
-            for (int i = 0; i < 8; ++i) len = (len << 8) | p[2 + i];
-            off = 10;
+    std::string rx_acc_;
+
+    bool SendAll(const char* data, int len) {
+        int sent = 0;
+        while (sent < len) {
+            int r = send(s, data + sent, len - sent, 0);
+            if (r <= 0) return false;
+            sent += r;
         }
+        return true;
+    }
+
+    bool SendRawFrame(uint8_t opcode, const void* data, size_t len) {
+        if (s == INVALID_SOCKET) return false;
+        std::vector<unsigned char> frame;
+        frame.reserve(len + 14);
+        frame.push_back(static_cast<unsigned char>(0x80 | (opcode & 0x0F)));
+
         unsigned char mask[4]{};
-        if (masked) {
-            if (acc.size() < off + 4) return false;
-            memcpy(mask, p + off, 4);
-            off += 4;
+        BCryptGenRandom(nullptr, mask, sizeof(mask), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+
+        if (len < 126) {
+            frame.push_back(static_cast<unsigned char>(0x80 | len));
+        } else if (len <= 0xFFFF) {
+            frame.push_back(0x80 | 126);
+            frame.push_back(static_cast<unsigned char>((len >> 8) & 0xFF));
+            frame.push_back(static_cast<unsigned char>(len & 0xFF));
+        } else {
+            frame.push_back(0x80 | 127);
+            uint64_t n64 = len;
+            for (int i = 7; i >= 0; --i)
+                frame.push_back(static_cast<unsigned char>((n64 >> (8 * i)) & 0xFF));
         }
-        if (acc.size() < off + (size_t)len) return false;
-        std::string payload(len, '\0');
-        for (uint64_t i = 0; i < len; ++i) {
-            unsigned char c = p[off + i];
-            payload[(size_t)i] = masked ? (char)(c ^ mask[i & 3]) : (char)c;
+        frame.insert(frame.end(), mask, mask + 4);
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < len; ++i)
+            frame.push_back(bytes[i] ^ mask[i & 3]);
+
+        return SendAll(reinterpret_cast<const char*>(frame.data()), (int)frame.size());
+    }
+
+    bool TryParse(std::string& out) {
+        while (rx_acc_.size() >= 2) {
+            const auto* p = reinterpret_cast<const unsigned char*>(rx_acc_.data());
+            bool fin    = (p[0] & 0x80) != 0;
+            int opcode  = p[0] & 0x0F;
+            bool masked = (p[1] & 0x80) != 0;
+            uint64_t len = p[1] & 0x7F;
+            size_t off = 2;
+
+            if (len == 126) {
+                if (rx_acc_.size() < 4) return false;
+                len = (static_cast<uint64_t>(p[2]) << 8) | p[3];
+                off = 4;
+            } else if (len == 127) {
+                if (rx_acc_.size() < 10) return false;
+                len = 0;
+                for (int i = 0; i < 8; ++i) len = (len << 8) | p[2 + i];
+                off = 10;
+            }
+            unsigned char mask[4]{};
+            if (masked) {
+                if (rx_acc_.size() < off + 4) return false;
+                std::memcpy(mask, p + off, 4);
+                off += 4;
+            }
+            if (rx_acc_.size() < off + static_cast<size_t>(len)) return false;
+
+            std::string payload(static_cast<size_t>(len), '\0');
+            for (uint64_t i = 0; i < len; ++i) {
+                unsigned char c = p[off + i];
+                payload[static_cast<size_t>(i)] = masked ? static_cast<char>(c ^ mask[i & 3]) : static_cast<char>(c);
+            }
+            rx_acc_.erase(0, off + static_cast<size_t>(len));
+
+            if (opcode == 0x9) {
+                SendRawFrame(0xA, payload.data(), payload.size());
+                continue;
+            }
+            if (opcode == 0xA) continue;
+            if (opcode == 0x8) return true;
+            if (opcode == 0x1 || opcode == 0x0) {
+                out += payload;
+                if (fin) return true;
+            }
         }
-        acc.erase(0, off + (size_t)len);
-        if (opcode == 0x1 || opcode == 0x0) { out += payload; return fin; }
-        if (opcode == 0x8) return true;
-        if (opcode == 0x9) return false; // ping ignored
         return false;
     }
 };

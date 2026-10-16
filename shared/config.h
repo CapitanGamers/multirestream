@@ -16,7 +16,7 @@ struct AppConfig {
     std::string ingest_app = "live";
     std::string ingest_key = "stream";
     std::string bind_ip = "0.0.0.0";
-    std::string public_host;         // IP/DNS that OBS on the home PC must use
+    std::string public_host;
     std::string auth_token;          // clients must present this
     std::string ffmpeg_path = "ffmpeg\\bin\\ffmpeg.exe";
     std::string log_dir = "logs";
@@ -35,7 +35,7 @@ inline std::string DefaultConfigJson() {
   "ingest_app": "live",
   "ingest_key": "CHANGE_ME_SECRET",
   "bind_ip": "0.0.0.0",
-  "public_host": "91.216.104.42",
+  "public_host": "YOUR_VPS_IP",
   "auth_token": "change-this-dashboard-token",
   "ffmpeg_path": "ffmpeg\\\\bin\\\\ffmpeg.exe",
   "destinations": [
@@ -66,6 +66,15 @@ inline std::string DefaultConfigJson() {
       "enabled": false,
       "rtmp_url": "rtmps://fa723fc1b171.global-contribute.live-video.net/app/YOUR_KICK_KEY",
       "channel": "your_kick_slug",
+      "oauth_token": ""
+    },
+    {
+      "id": "facebook",
+      "platform": "facebook",
+      "title": "Facebook",
+      "enabled": false,
+      "rtmp_url": "rtmps://live-api-s.facebook.com:443/rtmp/YOUR_FACEBOOK_STREAM_KEY",
+      "channel": "",
       "oauth_token": ""
     }
   ]

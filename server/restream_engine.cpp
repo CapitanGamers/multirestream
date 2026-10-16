@@ -4,8 +4,21 @@
 
 #include <windows.h>
 #include <sstream>
+#include <cctype>
 
 namespace mr {
+
+static double ParseTrailingNumber(const std::string& s, std::size_t pos) {
+    while (pos < s.size() && std::isspace((unsigned char)s[pos])) ++pos;
+    std::size_t start = pos;
+    while (pos < s.size() && (std::isdigit((unsigned char)s[pos]) || s[pos] == '.')) ++pos;
+    if (pos == start) return 0.0;
+    try {
+        return std::stod(s.substr(start, pos - start));
+    } catch (...) {
+        return 0.0;
+    }
+}
 
 RestreamEngine::RestreamEngine(LogFn log) : log_(std::move(log)) {}
 
@@ -23,16 +36,22 @@ AppConfig RestreamEngine::GetConfig() const {
     return cfg_;
 }
 
+EngineStatus RestreamEngine::Status() const {
+    EngineStatus s;
+    s.running = running_.load();
+    s.publisher_connected = publisher_connected_.load();
+    s.kbps = kbps_.load();
+    s.total_bytes = total_bytes_.load();
+    return s;
+}
+
 std::string RestreamEngine::BuildFfmpegCommand() const {
     std::lock_guard<std::mutex> g(mu_);
     std::ostringstream cmd;
     std::string ff = cfg_.ffmpeg_path;
     if (ff.find(':') == std::string::npos) {
-        char exe[MAX_PATH]{};
-        GetModuleFileNameA(nullptr, exe, MAX_PATH);
-        std::string dir = exe;
-        auto sl = dir.find_last_of("\\/");
-        if (sl != std::string::npos) dir.resize(sl + 1);
+        std::string dir = WideToUtf8(ExeDir());
+        if (!dir.empty() && dir.back() != '\\' && dir.back() != '/') dir += '\\';
         ff = dir + ff;
     }
     cmd << "\"" << ff << "\"";
@@ -60,6 +79,50 @@ std::string RestreamEngine::BuildFfmpegCommand() const {
     return cmd.str();
 }
 
+void RestreamEngine::PumpLog(void* read_pipe, std::wstring log_path) {
+    HANDLE rp = static_cast<HANDLE>(read_pipe);
+    HANDLE lf = CreateFileW(log_path.c_str(), FILE_APPEND_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (lf != INVALID_HANDLE_VALUE) {
+        SetFilePointer(lf, 0, nullptr, FILE_END);
+        const char banner[] = "\r\n----- ffmpeg spawn -----\r\n";
+        DWORD wr = 0;
+        WriteFile(lf, banner, (DWORD)(sizeof(banner) - 1), &wr, nullptr);
+    } else {
+        Logger::I().Warn("ffmpeg", "cannot open ffmpeg log file", GetLastError());
+    }
+
+    std::string carry;
+    char buf[4096];
+    for (;;) {
+        DWORD n = 0;
+        BOOL ok = ReadFile(rp, buf, sizeof(buf), &n, nullptr);
+        if (!ok || n == 0) break;
+        if (lf != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(lf, buf, n, &wr, nullptr);
+        }
+        carry.append(buf, n);
+
+        if (!publisher_connected_.load() && carry.find("Input #0") != std::string::npos) {
+            publisher_connected_.store(true);
+            if (log_) log_("اتصال ورودی برقرار شد — پخش زنده آغاز شد");
+        }
+        auto br = carry.rfind("bitrate=");
+        if (br != std::string::npos) kbps_.store(ParseTrailingNumber(carry, br + 8));
+        auto sz = carry.rfind("size=");
+        if (sz != std::string::npos) {
+            double kb = ParseTrailingNumber(carry, sz + 5);
+            total_bytes_.store((std::int64_t)(kb * 1024.0));
+        }
+        if (carry.size() > 8192) carry.erase(0, carry.size() - 4096);
+    }
+
+    if (lf != INVALID_HANDLE_VALUE) CloseHandle(lf);
+    CloseHandle(rp);
+}
+
 bool RestreamEngine::SpawnFfmpeg() {
     KillFfmpeg();
     const std::string cmd8 = BuildFfmpegCommand();
@@ -74,29 +137,23 @@ bool RestreamEngine::SpawnFfmpeg() {
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
-    std::wstring flog = Logger::I().FfmpegLogPath();
-    HANDLE logf = CreateFileW(flog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (logf == INVALID_HANDLE_VALUE) {
-        Logger::I().Warn("ffmpeg", "cannot open ffmpeg log file", GetLastError());
-        logf = nullptr;
-    } else {
-        SetFilePointer(logf, 0, nullptr, FILE_END);
-        const char banner[] = "\r\n----- ffmpeg spawn -----\r\n";
-        DWORD wr = 0;
-        WriteFile(logf, banner, (DWORD)sizeof(banner) - 1, &wr, nullptr);
+
+    HANDLE read_pipe = nullptr;
+    HANDLE write_pipe = nullptr;
+    if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
+        Logger::I().Error("ffmpeg", "CreatePipe failed", GetLastError());
+        if (log_) log_("FFmpeg start failed — pipe creation error");
+        return false;
     }
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
-    if (logf) {
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-        si.hStdOutput = logf;
-        si.hStdError = logf;
-    }
+    si.hStdInput = nullptr;
+    si.hStdOutput = write_pipe;
+    si.hStdError = write_pipe;
     PROCESS_INFORMATION pi{};
 
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
@@ -111,12 +168,13 @@ bool RestreamEngine::SpawnFfmpeg() {
         CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
         nullptr, nullptr, &si, &pi);
 
-    if (logf) CloseHandle(logf);
+    CloseHandle(write_pipe);
 
     if (!ok) {
         DWORD e = GetLastError();
         Logger::I().Error("ffmpeg", "CreateProcess failed — is ffmpeg.exe on PATH?", e);
         if (log_) log_("FFmpeg start failed, win=" + std::to_string(e));
+        CloseHandle(read_pipe);
         if (job) CloseHandle(job);
         return false;
     }
@@ -127,6 +185,13 @@ bool RestreamEngine::SpawnFfmpeg() {
     process_id_ = pi.dwProcessId;
     CloseHandle(pi.hThread);
     running_.store(true);
+    publisher_connected_.store(false);
+    kbps_.store(0.0);
+    total_bytes_.store(0);
+
+    std::wstring flog = Logger::I().FfmpegLogPath();
+    pump_thread_ = std::thread([this, read_pipe, flog] { PumpLog(read_pipe, flog); });
+
     Logger::I().Info("ffmpeg", "started pid=" + std::to_string(process_id_));
     if (log_) log_("FFmpeg started, pid=" + std::to_string(process_id_));
     return true;
@@ -146,9 +211,12 @@ void RestreamEngine::KillFfmpeg() {
         CloseHandle(static_cast<HANDLE>(job_handle_));
         job_handle_ = nullptr;
     }
+    if (pump_thread_.joinable()) pump_thread_.join();
     process_id_ = 0;
     running_.store(false);
     publisher_connected_.store(false);
+    kbps_.store(0.0);
+    total_bytes_.store(0);
 }
 
 bool RestreamEngine::Start() {
@@ -161,15 +229,21 @@ void RestreamEngine::Stop() {
 }
 
 void RestreamEngine::Tick() {
+    if (restart_after_ms_ > 0) {
+        if (NowMs() >= restart_after_ms_) {
+            restart_after_ms_ = 0;
+            SpawnFfmpeg();
+        }
+        return;
+    }
     if (!process_handle_) return;
     HANDLE h = static_cast<HANDLE>(process_handle_);
     DWORD code = 0;
     if (GetExitCodeProcess(h, &code) && code != STILL_ACTIVE) {
-        Logger::I().Error("ffmpeg", "process exited, code=" + std::to_string(code) + " — restart in 2s");
+        Logger::I().Error("ffmpeg", "process exited, code=" + std::to_string(code) + " — restart scheduled in 2s");
         if (log_) log_("FFmpeg exited with code " + std::to_string(code) + " — restarting in 2s");
         KillFfmpeg();
-        Sleep(2000);
-        SpawnFfmpeg();
+        restart_after_ms_ = NowMs() + 2000;
     }
 }
 
@@ -194,7 +268,7 @@ void RestreamEngine::UpsertDestination(const Destination& d) {
         bool found = false;
         for (auto& x : cfg_.destinations) {
             if (x.id == d.id || (x.platform == d.platform && d.platform != Platform::Custom)) {
-                if (!d.rtmp_url.empty() && x.rtmp_url != d.rtmp_url) restart = true;
+                if ((!d.rtmp_url.empty() && x.rtmp_url != d.rtmp_url) || x.enabled != d.enabled) restart = true;
                 if (!d.rtmp_url.empty()) x.rtmp_url = d.rtmp_url;
                 if (!d.channel.empty()) x.channel = d.channel;
                 if (!d.oauth_token.empty()) x.oauth_token = d.oauth_token;

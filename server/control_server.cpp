@@ -83,6 +83,8 @@ void ControlServer::AcceptLoop() {
         
         int flag = 1;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+        DWORD snd_timeout = 2000;
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (char*)&snd_timeout, sizeof(snd_timeout));
 
         char ip[64]{};
         inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip));
@@ -116,12 +118,14 @@ void ControlServer::ClientLoop(unsigned long long sock) {
                 authed = json::ExtractString(line, "token") == auth_ || auth_.empty();
                 Logger::I().Info("ctrl", authed ? "auth ok" : "auth rejected (bad token)");
                 std::string r = std::string("{\"type\":\"auth_ok\",\"ok\":") + (authed ? "true" : "false") + "}\n";
+                std::lock_guard<std::mutex> g(mu_);
                 send(s, r.data(), (int)r.size(), 0);
                 continue;
             }
             if (!authed) {
                 Logger::I().Warn("ctrl", "command before auth, type=" + type);
                 const char* r = "{\"type\":\"error\",\"error\":\"auth\"}\n";
+                std::lock_guard<std::mutex> g(mu_);
                 send(s, r, (int)strlen(r), 0);
                 continue;
             }
@@ -129,6 +133,7 @@ void ControlServer::ClientLoop(unsigned long long sock) {
                 std::string resp = on_cmd_(line);
                 if (!resp.empty()) {
                     if (resp.back() != '\n') resp += '\n';
+                    std::lock_guard<std::mutex> g(mu_);
                     send(s, resp.data(), (int)resp.size(), 0);
                 }
             }

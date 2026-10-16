@@ -70,7 +70,8 @@ inline std::string RedactSecrets(std::string s) {
         if (last == std::string::npos) last = s.size();
         auto slash = s.rfind('/', last);
         auto prev = slash == std::string::npos ? std::string::npos : s.rfind('/', slash - 1);
-        if (slash != std::string::npos && slash + 8 < last) {
+        auto proto_end = s.find("://", r);
+        if (proto_end != std::string::npos && prev != std::string::npos && prev > proto_end + 2 && slash > prev) {
             s.replace(slash + 1, last - slash - 1, "…REDACTED");
             last = slash + 11;
         }

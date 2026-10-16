@@ -18,6 +18,7 @@
 #include <memory>
 #include <fstream>
 #include <atomic>
+#include <iostream>
 
 using namespace mr;
 
@@ -39,6 +40,13 @@ static std::unique_ptr<ControlServer> g_ctrl;
 static std::mutex g_view_mu;
 static std::vector<ViewerSnapshot> g_views;
 
+struct DestRow {
+    DestRuntime rt;
+    ViewerSnapshot view;
+    bool has_view = false;
+};
+static std::vector<DestRow> g_dest_rows;
+
 static COLORREF C_BG         = RGB(24, 25, 28);
 static COLORREF C_PANEL      = RGB(43, 45, 49);
 static COLORREF C_TEXT       = RGB(242, 243, 245);
@@ -49,19 +57,33 @@ static COLORREF C_BTN_SEC    = RGB(78, 80, 88);
 static COLORREF C_BTN_SEC_DN = RGB(104, 109, 115);
 static COLORREF C_BTN_DANGER = RGB(237, 66, 69);
 static COLORREF C_BTN_DAN_DN = RGB(196, 52, 54);
+static COLORREF C_LIVE       = RGB(88, 255, 120);
+static COLORREF C_WARN       = RGB(230, 200, 90);
+static COLORREF C_OFFLINE    = RGB(255, 140, 100);
+
+static bool WantsConsole();
 
 static void UiLog(const std::string& s) {
     Logger::I().Info("ui", s);
-    if (!g_wnd) return;
-    auto* heap = new std::wstring(Utf8ToWide(s));
-    PostMessageW(g_wnd, WM_APP_LOG, 0, (LPARAM)heap);
+    if (g_wnd) {
+        auto* heap = new std::wstring(Utf8ToWide(s));
+        PostMessageW(g_wnd, WM_APP_LOG, 0, (LPARAM)heap);
+    } else if (WantsConsole()) {
+        std::cout << s << std::endl;
+    }
 }
 
 static void AppendLog(const std::wstring& line) {
+    if (!g_log) return;
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t ts[32]; swprintf(ts, 32, L"[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     std::wstring full = std::wstring(ts) + line + L"\r\n";
     int len = GetWindowTextLengthW(g_log);
+    if (len > 20000) {
+        SendMessageW(g_log, EM_SETSEL, 0, 8000);
+        SendMessageW(g_log, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        len = GetWindowTextLengthW(g_log);
+    }
     SendMessageW(g_log, EM_SETSEL, len, len);
     SendMessageW(g_log, EM_REPLACESEL, FALSE, (LPARAM)full.c_str());
 }
@@ -77,14 +99,33 @@ static std::string PublicHostGuess() {
 }
 
 static void RefreshDestList() {
-    SendMessageW(g_dest, LB_RESETCONTENT, 0, 0);
-    if (!g_engine) return;
+    if (!g_engine || !g_dest) return;
     auto dests = g_engine->Destinations();
+    std::vector<ViewerSnapshot> views;
+    { std::lock_guard<std::mutex> g(g_view_mu); views = g_views; }
+
+    bool count_changed = (dests.size() != g_dest_rows.size());
+    int prev_sel = static_cast<int>(SendMessageW(g_dest, LB_GETCURSEL, 0, 0));
+
+    g_dest_rows.clear();
+    if (count_changed) SendMessageW(g_dest, LB_RESETCONTENT, 0, 0);
+
     for (const auto& r : dests) {
-        std::wstring line = Utf8ToWide(std::string(r.dest.enabled ? "[ON]  " : "[OFF] "));
-        line += Utf8ToWide(r.dest.title.empty() ? r.dest.id : r.dest.title) + L"  —  " + Utf8ToWide(PlatformId(r.dest.platform));
-        SendMessageW(g_dest, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+        DestRow row;
+        row.rt = r;
+        for (const auto& v : views) {
+            if (v.platform == r.dest.platform) { row.view = v; row.has_view = true; break; }
+        }
+        g_dest_rows.push_back(row);
+        if (count_changed) {
+            std::wstring fallback = Utf8ToWide(r.dest.title.empty() ? r.dest.id : r.dest.title);
+            SendMessageW(g_dest, LB_ADDSTRING, 0, (LPARAM)fallback.c_str());
+        }
     }
+    if (count_changed && prev_sel >= 0 && prev_sel < static_cast<int>(g_dest_rows.size()))
+        SendMessageW(g_dest, LB_SETCURSEL, prev_sel, 0);
+
+    InvalidateRect(g_dest, nullptr, FALSE);
 }
 
 static void RefreshIngestBox() {
@@ -121,6 +162,16 @@ static void BroadcastView(const ViewerSnapshot& v) {
     g_ctrl->Broadcast(o.str());
 }
 
+static void BroadcastEngine() {
+    if (!g_ctrl || !g_engine) return;
+    auto st = g_engine->Status();
+    std::ostringstream o;
+    o << "{\"type\":\"engine\",\"running\":" << (st.running ? "true" : "false")
+      << ",\"publisher\":" << (st.publisher_connected ? "true" : "false")
+      << ",\"kbps\":" << (long long)st.kbps << "}";
+    g_ctrl->Broadcast(o.str());
+}
+
 static std::string HandleClientCmd(const std::string& line) {
     std::string type = json::ExtractString(line, "type");
     if (type == "ping") return "{\"type\":\"pong\"}";
@@ -146,8 +197,11 @@ static std::string HandleClientCmd(const std::string& line) {
         PostMessageW(g_wnd, WM_COMMAND, IDC_RELOAD, 0); return "{\"type\":\"ok\"}";
     }
     if (type == "get_state") {
+        EngineStatus est = g_engine ? g_engine->Status() : EngineStatus{};
         std::ostringstream o;
-        o << "{\"type\":\"state\",\"running\":" << (g_engine && g_engine->Running() ? "true" : "false")
+        o << "{\"type\":\"state\",\"running\":" << (est.running ? "true" : "false")
+          << ",\"publisher\":" << (est.publisher_connected ? "true" : "false")
+          << ",\"kbps\":" << (long long)est.kbps
           << ",\"ingest\":\"" << json::Escape(g_cfg.IngestUrlHint(PublicHostGuess())) << "\",\"dests\":[";
         auto dests = g_engine ? g_engine->Destinations() : std::vector<DestRuntime>{};
         for (size_t i = 0; i < dests.size(); ++i) {
@@ -207,21 +261,72 @@ static void DrawModernButton(DRAWITEMSTRUCT* di) {
     DrawTextW(di->hDC, txt, -1, &di->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+static void DrawDestRow(DRAWITEMSTRUCT* di) {
+    if (di->itemID == (UINT)-1 || di->itemID >= g_dest_rows.size()) return;
+    const auto& row = g_dest_rows[di->itemID];
+    HDC dc = di->hDC;
+    RECT r = di->rcItem;
+    bool sel = (di->itemState & ODS_SELECTED) != 0;
+    HBRUSH br = CreateSolidBrush(sel ? RGB(53, 55, 63) : C_PANEL);
+    FillRect(dc, &r, br);
+    DeleteObject(br);
+
+    RECT dot{ r.left + 10, r.top + 5, r.left + 10 + 26, r.bottom - 5 };
+    COLORREF pc = PlatformColor((int)row.rt.dest.platform);
+    HBRUSH pb = CreateSolidBrush(row.rt.dest.enabled ? pc : RGB(90, 90, 95));
+    HGDIOBJ ob = SelectObject(dc, pb);
+    Ellipse(dc, dot.left, dot.top, dot.right, dot.bottom);
+    SelectObject(dc, ob);
+    DeleteObject(pb);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    SelectObject(dc, g_font_sm);
+    DrawTextW(dc, PlatformGlyph((int)row.rt.dest.platform), -1, &dot, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    RECT title{ dot.right + 10, r.top + 2, r.left + (r.right - r.left) * 55 / 100, r.bottom - 2 };
+    SetTextColor(dc, C_TEXT);
+    SelectObject(dc, g_font);
+    std::wstring t = Utf8ToWide(row.rt.dest.title.empty() ? row.rt.dest.id : row.rt.dest.title);
+    if (!row.rt.dest.enabled) t += L"  (خاموش)";
+    DrawTextW(dc, t.c_str(), -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    RECT stat{ title.right, r.top + 2, r.right - 12, r.bottom - 2 };
+    std::wstring s;
+    COLORREF sc = C_TEXT_DIM;
+    if (!row.rt.dest.enabled) {
+        s = L"غیرفعال";
+    } else if (row.has_view && row.view.live) {
+        s = L"زنده — " + FormatViewers(row.view.viewers) + L" بیننده";
+        sc = C_LIVE;
+    } else if (row.has_view) {
+        s = Utf8ToWide(row.view.status.empty() ? "آفلاین" : row.view.status);
+        sc = C_OFFLINE;
+    } else if (row.rt.process_alive) {
+        s = L"در حال ارسال…";
+        sc = C_WARN;
+    } else {
+        s = L"—";
+    }
+    SetTextColor(dc, sc);
+    DrawTextW(dc, s.c_str(), -1, &stat, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
 static void Layout(HWND h) {
     RECT rc; GetClientRect(h, &rc);
-    const int m = 20;
+    const int m = 16;
     int y = m;
-    MoveWindow(GetDlgItem(h, 200), m, y, rc.right - 2 * m, 24, TRUE); y += 30;
-    MoveWindow(g_ingest, m, y, rc.right - 2 * m - 110, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_COPY), rc.right - m - 100, y, 100, 36, TRUE); y += 50;
-    MoveWindow(GetDlgItem(h, IDC_START), m, y, 120, 36, TRUE);
-    MoveWindow(GetDlgItem(h, IDC_STOP), m + 130, y, 120, 36, TRUE);
-    MoveWindow(g_status, m + 270, y + 8, 220, 24, TRUE);
-    MoveWindow(g_clients, rc.right - m - 160, y + 8, 160, 24, TRUE); y += 50;
-    MoveWindow(GetDlgItem(h, 201), m, y, 300, 24, TRUE); y += 30;
-    int dest_h = 130;
-    MoveWindow(g_dest, m, y, rc.right - 2 * m, dest_h, TRUE); y += dest_h + 16;
-    MoveWindow(GetDlgItem(h, 202), m, y, 200, 24, TRUE); y += 30;
+    MoveWindow(GetDlgItem(h, 200), m, y, rc.right - 2 * m, 22, TRUE); y += 26;
+    MoveWindow(g_ingest, m, y, rc.right - 2 * m - 100, 32, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_COPY), rc.right - m - 92, y, 92, 32, TRUE); y += 44;
+    MoveWindow(GetDlgItem(h, IDC_START), m, y, 110, 34, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_STOP), m + 118, y, 110, 34, TRUE);
+    MoveWindow(g_status, m + 240, y + 6, 220, 22, TRUE);
+    MoveWindow(g_clients, rc.right - m - 140, y + 6, 140, 22, TRUE); y += 46;
+    MoveWindow(GetDlgItem(h, 201), m, y, rc.right - 2 * m, 22, TRUE); y += 26;
+    int dest_h = 120;
+    MoveWindow(g_dest, m, y, rc.right - 2 * m, dest_h, TRUE); y += dest_h + 14;
+    MoveWindow(GetDlgItem(h, 202), m, y, rc.right - 2 * m, 22, TRUE); y += 26;
     MoveWindow(g_log, m, y, rc.right - 2 * m, rc.bottom - y - m, TRUE);
 }
 
@@ -246,27 +351,35 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
-        mk(L"STATIC", L"آدرس اینجست برای نرم افزار استریم شما (OBS/Vmix):", 0, 200);
+        mk(L"STATIC", L"آدرس اینجست OBS:", SS_RIGHT, 200);
         g_ingest = ed(IDC_INGEST, ES_READONLY | ES_AUTOHSCROLL);
         btn(L"کپی لینک", IDC_COPY);
         btn(L"شروع استریم", IDC_START); btn(L"توقف استریم", IDC_STOP);
         g_status = mk(L"STATIC", L"وضعیت: خاموش", 0, IDC_STATUS);
         g_clients = mk(L"STATIC", L"کلاینت: ۰", SS_RIGHT, IDC_CLIENTS);
-        mk(L"STATIC", L"مقصدها (پلتفرمها) - دوبار کلیک جهت قطع/وصل:", 0, 201);
+        mk(L"STATIC", L"مقصدها (دوبار کلیک برای روشن/خاموش):", SS_RIGHT, 201);
         
-        g_dest = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_NOTIFY,
+        g_dest = CreateWindowExW(0, L"LISTBOX", L"",
+                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_NOTIFY |
+                                 LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
                                  0, 0, 10, 10, h, (HMENU)IDC_DEST_LIST, GetModuleHandleW(nullptr), nullptr);
         SetWindowFont(g_dest, g_font);
         
-        mk(L"STATIC", L"گزارش سرور:", 0, 202);
+        mk(L"STATIC", L"گزارش سرور:", SS_RIGHT, 202);
         g_log = ed(IDC_LOG, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL);
         SetWindowFont(g_log, g_font_sm);
         SetTimer(h, 1, 1000, nullptr);
         return 0;
     }
     case WM_SIZE: Layout(h); return 0;
+    case WM_MEASUREITEM: {
+        auto* mi = (MEASUREITEMSTRUCT*)l;
+        if (mi->CtlID == IDC_DEST_LIST) { mi->itemHeight = 34; return TRUE; }
+        break;
+    }
     case WM_DRAWITEM: {
         auto* di = (DRAWITEMSTRUCT*)l;
+        if (di->CtlType == ODT_LISTBOX && di->CtlID == IDC_DEST_LIST) { DrawDestRow(di); return TRUE; }
         if (di->CtlType == ODT_BUTTON) { DrawModernButton(di); return TRUE; }
         break;
     }
@@ -311,13 +424,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     case WM_TIMER:
         if (g_engine) g_engine->Tick();
+        RefreshDestList();
+        BroadcastEngine();
         if (g_ctrl) { wchar_t b[64]; swprintf(b, 64, L"کلاینتهای داشبورد: %d", g_ctrl->ClientCount()); SetWindowTextW(g_clients, b); }
-        if (g_engine && g_engine->Running()) SetWindowTextW(g_status, L"وضعیت: در حال پخش زنده");
+        if (g_engine) {
+            auto st = g_engine->Status();
+            wchar_t b2[160];
+            if (!st.running) swprintf(b2, 160, L"وضعیت: خاموش");
+            else if (!st.publisher_connected) swprintf(b2, 160, L"وضعیت: در انتظار اتصال OBS");
+            else swprintf(b2, 160, L"وضعیت: در حال پخش زنده — %.1f Mbps", st.kbps / 1000.0);
+            SetWindowTextW(g_status, b2);
+        }
         return 0;
     case WM_APP_LOG: { auto* s = reinterpret_cast<std::wstring*>(l); if (s) { AppendLog(*s); delete s; } return 0; }
     case WM_DESTROY: KillTimer(h, 1); if (g_ctrl) g_ctrl->Stop(); if (g_chat) g_chat->Stop(); if (g_engine) g_engine->Stop(); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(h, msg, w, l);
+}
+
+static void ServerHeartbeatTick() {
+    if (g_engine) g_engine->Tick();
+    BroadcastEngine();
 }
 
 static bool WantsConsole() {
@@ -342,11 +469,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     InitWinsock(); LoadOrCreateConfig();
 
     if (WantsConsole()) {
-        AllocConsole(); SetConsoleTitleW(L"MultiRestream Server"); SetConsoleCtrlHandler(ConsoleCtrl, TRUE);
-        StartServices(); if (g_engine) g_engine->Start();
-        while (g_headless_run.load()) { if (g_engine) g_engine->Tick(); Sleep(1000); }
-        if (g_ctrl) g_ctrl->Stop(); if (g_chat) g_chat->Stop(); if (g_engine) g_engine->Stop();
-        WSACleanup(); return 0;
+        AllocConsole();
+        FILE* fp = nullptr;
+        freopen_s(&fp, "CONOUT$", "w", stdout);
+        freopen_s(&fp, "CONOUT$", "w", stderr);
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleTitleW(L"MultiRestream Server (Headless)");
+        SetConsoleCtrlHandler(ConsoleCtrl, TRUE);
+
+        StartServices();
+        if (g_engine) g_engine->Start();
+        while (g_headless_run.load()) {
+            ServerHeartbeatTick();
+            Sleep(1000);
+        }
+        if (g_ctrl) g_ctrl->Stop();
+        if (g_chat) g_chat->Stop();
+        if (g_engine) g_engine->Stop();
+        WSACleanup();
+        return 0;
     }
 
     WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = inst; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
